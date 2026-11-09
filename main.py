@@ -1,29 +1,16 @@
 import os
 import tempfile
 import subprocess
-
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
 app = FastAPI(
-    title="MJR Downloader API",
-    description="Authorized media processing service",
-    version="1.0.0"
+    title="MJR TikTok Downloader API",
+    description="TikTok Video & Audio Downloader Service",
+    version="2.0.0"
 )
-
-MAX_SIZE = 50 * 1024 * 1024  # 50 MB
-ALLOWED_TYPES = {
-    "video/mp4",
-    "video/quicktime",
-    "audio/mpeg",
-    "audio/mp4",
-    "audio/wav",
-    "audio/x-wav",
-    "application/octet-stream"
-}
-
 
 @app.get("/")
 def home():
@@ -32,99 +19,77 @@ def home():
         "status": "online"
     }
 
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-
-@app.post("/process")
-async def process_media(
-    file: UploadFile = File(...),
-    format: str = Query(..., pattern="^(mp3|mp4)$")
+@app.get("/download")
+async def download_tiktok(
+    url: str = Query(..., description="TikTok video URL"),
+    format: str = Query(..., pattern="^(mp3|mp4)$", description="Download format: mp3 or mp4")
 ):
-    content_type = (file.content_type or "").lower()
-
-    if content_type not in ALLOWED_TYPES:
-        raise HTTPException(
-            status_code=415,
-            detail="Unsupported media type"
-        )
-
-    temp_dir = tempfile.mkdtemp(prefix="mjr_")
-    input_path = Path(temp_dir) / "input"
-    output_path = Path(temp_dir) / (
-        "download.mp3" if format == "mp3"
-        else "download.mp4"
-    )
+    temp_dir = tempfile.mkdtemp(prefix="mjr_tiktok_")
+    output_template = str(Path(temp_dir) / "output.%(ext)s")
 
     try:
-        size = 0
+        # yt-dlp কমান্ড দিয়ে টিকটক ভিডিও ডাউনলোড করা
+        cmd = [
+            "yt-dlp",
+            "-o", output_template,
+            "--no-check-certificates",
+            url
+        ]
 
-        with open(input_path, "wb") as output:
-            while True:
-                chunk = await file.read(1024 * 1024)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
 
-                if not chunk:
-                    break
-
-                size += len(chunk)
-
-                if size > MAX_SIZE:
-                    raise HTTPException(
-                        status_code=413,
-                        detail="File exceeds 50 MB limit"
-                    )
-
-                output.write(chunk)
-
-        if size == 0:
+        if result.returncode != 0:
             raise HTTPException(
-                status_code=400,
-                detail="Empty file"
+                status_code=422,
+                detail="Failed to download video from TikTok link. Please check the URL."
             )
 
-        if format == "mp4":
-            if content_type not in (
-                "video/mp4",
-                "video/quicktime",
-                "application/octet-stream"
-            ):
-                raise HTTPException(
-                    status_code=415,
-                    detail="Please upload a video file"
-                )
+        # ডাউনলোড হওয়া ফাইলটি খুঁজে বের করা
+        downloaded_files = list(Path(temp_dir).glob("output.*"))
+        if not downloaded_files:
+            raise HTTPException(
+                status_code=500,
+                detail="Downloaded file not found"
+            )
 
-            os.replace(input_path, output_path)
+        raw_file = downloaded_files[0]
+        final_output = Path(temp_dir) / ("download.mp3" if format == "mp3" else "download.mp4")
 
-        else:
-            command = [
+        # যদি ফরম্যাট mp3 চায়, তবে ffmpeg দিয়ে অডিও কনভার্ট করা
+        if format == "mp3":
+            conversion_cmd = [
                 "ffmpeg",
-                "-nostdin",
                 "-y",
-                "-i", str(input_path),
+                "-i", str(raw_file),
                 "-vn",
                 "-codec:a", "libmp3lame",
                 "-b:a", "192k",
-                str(output_path)
+                str(final_output)
             ]
-
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                timeout=180
-            )
-
-            if result.returncode != 0:
+            conv_result = subprocess.run(conversion_cmd, capture_output=True, timeout=120)
+            if conv_result.returncode != 0:
                 raise HTTPException(
                     status_code=422,
                     detail="Audio conversion failed"
                 )
+        else:
+            # mp4 চাইলে সরাসরি ফাইল রিনেম বা মুভ করা
+            if raw_file != final_output:
+                os.replace(raw_file, final_output)
 
-        if not output_path.exists():
+        if not final_output.exists():
             raise HTTPException(
                 status_code=500,
-                detail="Output file was not created"
+                detail="Final output file was not created"
             )
 
         def cleanup():
@@ -132,12 +97,9 @@ async def process_media(
             shutil.rmtree(temp_dir, ignore_errors=True)
 
         return FileResponse(
-            path=str(output_path),
-            filename=f"MJR_Download.{format}",
-            media_type=(
-                "audio/mpeg" if format == "mp3"
-                else "video/mp4"
-            ),
+            path=str(final_output),
+            filename=f"MJR_TikTok.{format}",
+            media_type="audio/mpeg" if format == "mp3" else "video/mp4",
             background=BackgroundTask(cleanup)
         )
 
@@ -151,16 +113,13 @@ async def process_media(
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(
             status_code=408,
-            detail="Conversion timed out"
+            detail="Process timed out"
         )
 
-    except Exception:
+    except Exception as e:
         import shutil
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise HTTPException(
             status_code=500,
-            detail="Processing failed"
+            detail=f"Internal server error: {str(e)}"
         )
-
-    finally:
-        await file.close()
